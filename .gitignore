@@ -1,0 +1,15 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Credentials (never commit!)
+*.json
