@@ -67,13 +67,11 @@ def update_queue_status(language, action, responder, run_date=None):
     try:
         client = get_bq_client()
         status = "approved" if action.lower() in ["approve", "approved"] else "rejected"
-        timestamp = datetime.utcnow().isoformat()
         
         query = f"""
         UPDATE `{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_QUEUE_TABLE}`
         SET status = @status,
-            approved_by = @approved_by,
-            approved_at = @approved_at
+            approved_by = @approved_by
         WHERE language = @language 
           AND status = 'pending_approval'
         """
@@ -81,7 +79,6 @@ def update_queue_status(language, action, responder, run_date=None):
         params = [
             bigquery.ScalarQueryParameter("status", "STRING", status),
             bigquery.ScalarQueryParameter("approved_by", "STRING", responder),
-            bigquery.ScalarQueryParameter("approved_at", "TIMESTAMP", timestamp),
             bigquery.ScalarQueryParameter("language", "STRING", language),
         ]
         
