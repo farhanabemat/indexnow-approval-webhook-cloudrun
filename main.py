@@ -2,7 +2,8 @@
 IndexNow Approval Webhook - Google Cloud Run
 =============================================
 Receives approval/rejection from Power Automate and records to BigQuery.
-Also updates indexnow_queue status and triggers URL processing.
+On approval: Fetches URLs from queue, submits to IndexNow, logs results.
+On rejection: Updates status and logs the rejection.
 
 Deploy to Cloud Run:
   gcloud run deploy indexnow-approval-webhook --source . --region us-central1 --allow-unauthenticated
@@ -10,6 +11,7 @@ Deploy to Cloud Run:
 
 import os
 import json
+import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
@@ -19,7 +21,11 @@ BQ_PROJECT_ID = os.environ.get("BQ_PROJECT_ID", "merck-466618")
 BQ_DATASET = os.environ.get("BQ_DATASET", "qa_automation")
 INDEXNOW_APPROVALS_TABLE = os.environ.get("INDEXNOW_APPROVALS_TABLE", "indexnow_approvals")
 INDEXNOW_QUEUE_TABLE = os.environ.get("INDEXNOW_QUEUE_TABLE", "indexnow_queue")
+INDEXNOW_LOG_TABLE = os.environ.get("INDEXNOW_LOG_TABLE", "IndexNow_log_report")
 URL_CHANGES_TABLE = os.environ.get("URL_CHANGES_TABLE", "url_changes")
+INDEXNOW_API_TABLE = os.environ.get("INDEXNOW_API_TABLE", "indexnow_api")
+INDEXNOW_BATCH_SIZE = 10000  # Max URLs per IndexNow request
+SCRIPT_NAME = "indexnow-approval-webhook"
 
 app = Flask(__name__)
 
@@ -27,6 +33,215 @@ app = Flask(__name__)
 def get_bq_client():
     """Get BigQuery client - uses default credentials in Cloud Run"""
     return bigquery.Client(project=BQ_PROJECT_ID)
+
+
+def get_indexnow_credentials():
+    """Fetch IndexNow API credentials from BigQuery, keyed by host"""
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT api_key, host, key_location
+        FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_API_TABLE}`
+        """
+        results = client.query(query).result()
+        
+        creds = {}
+        for row in results:
+            creds[row.host] = {
+                'api_key': row.api_key,
+                'host': row.host,
+                'key_location': row.key_location
+            }
+        print(f"Loaded IndexNow credentials for {len(creds)} hosts")
+        return creds
+    except Exception as e:
+        print(f"Error fetching IndexNow credentials: {e}")
+        return {}
+
+
+def extract_hostname(url):
+    """Extract hostname from URL"""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        return parsed.netloc
+    except:
+        return ""
+
+
+def get_queued_urls(language, run_date=None):
+    """Get URLs from indexnow_queue for a language"""
+    try:
+        client = get_bq_client()
+        
+        query = f"""
+        SELECT url, change_type, first_response, final_response, has_redirects
+        FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_QUEUE_TABLE}`
+        WHERE language = @language
+        """
+        
+        params = [
+            bigquery.ScalarQueryParameter("language", "STRING", language),
+        ]
+        
+        if run_date:
+            query += " AND run_date = @run_date"
+            params.append(bigquery.ScalarQueryParameter("run_date", "DATE", run_date))
+        
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        results = client.query(query, job_config=job_config).result()
+        
+        urls = []
+        for row in results:
+            urls.append({
+                'url': row.url,
+                'change_type': row.change_type,
+                'first_response': row.first_response,
+                'final_response': row.final_response,
+                'has_redirects': row.has_redirects
+            })
+        
+        print(f"Found {len(urls)} URLs in queue for {language}")
+        return urls
+    except Exception as e:
+        print(f"Error getting queued URLs: {e}")
+        return []
+
+
+def submit_to_indexnow_batch(urls, credentials):
+    """Submit URLs to IndexNow API in batches, grouped by host"""
+    if not urls or not credentials:
+        return [], 0, 0
+    
+    timestamp = datetime.utcnow().isoformat()
+    log_entries = []
+    success_count = 0
+    fail_count = 0
+    
+    # Group URLs by host
+    by_host = {}
+    for url_info in urls:
+        url = url_info['url']
+        host = extract_hostname(url)
+        if host in credentials:
+            by_host.setdefault(host, []).append(url_info)
+        else:
+            # No credentials for this host
+            log_entries.append({
+                "date_submitted": timestamp,
+                "URL": url,
+                "keylocation": "",
+                "host": host,
+                "indexnow_response": "Skipped",
+                "note": f"No credentials for {host}",
+                "script_name": SCRIPT_NAME
+            })
+            fail_count += 1
+    
+    # Submit in batches per host
+    for host, items in by_host.items():
+        creds = credentials[host]
+        
+        for i in range(0, len(items), INDEXNOW_BATCH_SIZE):
+            chunk = items[i:i+INDEXNOW_BATCH_SIZE]
+            url_list = [item['url'] for item in chunk]
+            
+            payload = {
+                "host": creds['host'],
+                "key": creds['api_key'],
+                "keyLocation": creds['key_location'],
+                "urlList": url_list
+            }
+            
+            try:
+                response = requests.post(
+                    "https://api.indexnow.org/indexnow",
+                    json=payload,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=30
+                )
+                code = response.status_code
+                success = code in (200, 202)
+            except requests.exceptions.Timeout:
+                code = "Timeout"
+                success = False
+            except Exception as e:
+                code = f"Error: {str(e)[:50]}"
+                success = False
+            
+            # Log each URL
+            for item in chunk:
+                log_entries.append({
+                    "date_submitted": timestamp,
+                    "URL": item['url'],
+                    "keylocation": creds['key_location'],
+                    "host": host,
+                    "indexnow_response": str(code),
+                    "note": f"Approved batch submission - {item.get('change_type', 'unknown')}",
+                    "script_name": SCRIPT_NAME
+                })
+                if success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+            
+            print(f"Submitted batch of {len(chunk)} URLs to {host}: {code}")
+    
+    return log_entries, success_count, fail_count
+
+
+def save_indexnow_log(log_entries):
+    """Save IndexNow log entries to BigQuery"""
+    if not log_entries:
+        return True
+    
+    try:
+        client = get_bq_client()
+        table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_LOG_TABLE}"
+        
+        errors = client.insert_rows_json(table_id, log_entries)
+        
+        if errors:
+            print(f"Error saving IndexNow log: {errors}")
+            return False
+        
+        print(f"Saved {len(log_entries)} entries to IndexNow_log_report")
+        return True
+    except Exception as e:
+        print(f"Error saving IndexNow log: {e}")
+        return False
+
+
+def delete_from_queue(language, run_date=None):
+    """Delete processed URLs from indexnow_queue"""
+    try:
+        client = get_bq_client()
+        
+        query = f"""
+        DELETE FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_QUEUE_TABLE}`
+        WHERE language = @language
+        """
+        
+        params = [
+            bigquery.ScalarQueryParameter("language", "STRING", language),
+        ]
+        
+        if run_date:
+            query += " AND run_date = @run_date"
+            params.append(bigquery.ScalarQueryParameter("run_date", "DATE", run_date))
+        
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        client.query(query, job_config=job_config).result()
+        
+        print(f"Deleted {language} URLs from queue")
+        return True
+    except Exception as e:
+        # Streaming buffer error is expected for recent inserts
+        if "streaming buffer" in str(e):
+            print(f"Cannot delete {language} from queue yet (streaming buffer)")
+        else:
+            print(f"Error deleting from queue: {e}")
+        return False
 
 
 def record_approval(run_date, language, action, responder, notes=None):
@@ -155,7 +370,11 @@ def get_queue_count(language, status="approved"):
 
 @app.route('/approval', methods=['POST'])
 def handle_approval():
-    """Handle approval webhook from Power Automate"""
+    """Handle approval webhook from Power Automate
+    
+    On approval: Fetches URLs from queue, submits to IndexNow, logs results
+    On rejection: Records rejection and updates status
+    """
     try:
         data = request.get_json()
         
@@ -177,45 +396,74 @@ def handle_approval():
             }), 400
         
         status = "approved" if action.lower() in ["approve", "approved"] else "rejected"
+        print(f"Processing {status} for {language} (run_date: {run_date}) by {responder}")
         
         # 1. Record to indexnow_approvals table
         record_success, record_msg = record_approval(run_date, language, action, responder, notes)
         
-        # 2. Update indexnow_queue status
-        queue_success, queue_msg = update_queue_status(language, action, responder, run_date)
+        # Initialize response data
+        response_data = {
+            "success": record_success,
+            "run_date": run_date,
+            "language": language,
+            "status": status,
+            "approved_by": responder,
+        }
         
-        # 3. If rejected, also update url_changes
-        if status == "rejected":
-            update_url_changes_status(language, "rejected", run_date)
-        
-        # 4. Get count of URLs ready for processing (if approved)
-        urls_ready = 0
         if status == "approved":
-            urls_ready = get_queue_count(language, "approved")
-        
-        if record_success:
-            response_data = {
-                "success": True,
-                "message": f"Recorded {status} for {language}",
-                "run_date": run_date,
-                "language": language,
-                "status": status,
-                "approved_by": responder,
-                "queue_updated": queue_success,
-            }
+            # APPROVAL FLOW: Submit to IndexNow immediately
+            print(f"Starting IndexNow submission for {language}...")
             
-            if status == "approved":
-                response_data["urls_ready_for_submission"] = urls_ready
-                response_data["next_step"] = "Run process_approved_indexnow.py to submit URLs to IndexNow"
+            # Get IndexNow credentials
+            credentials = get_indexnow_credentials()
+            if not credentials:
+                response_data["error"] = "Failed to load IndexNow credentials"
+                return jsonify(response_data), 500
             
-            return jsonify(response_data), 200
+            # Get URLs from queue
+            urls = get_queued_urls(language, run_date)
+            if not urls:
+                response_data["message"] = f"No URLs found in queue for {language}"
+                response_data["urls_submitted"] = 0
+                return jsonify(response_data), 200
+            
+            # Submit to IndexNow
+            log_entries, success_count, fail_count = submit_to_indexnow_batch(urls, credentials)
+            
+            # Save log to BigQuery
+            log_saved = save_indexnow_log(log_entries)
+            
+            # Try to delete from queue (may fail if in streaming buffer)
+            queue_deleted = delete_from_queue(language, run_date)
+            
+            # Update url_changes status
+            update_url_changes_status(language, "submitted", run_date)
+            
+            response_data.update({
+                "message": f"Submitted {success_count} URLs to IndexNow for {language}",
+                "urls_submitted": success_count,
+                "urls_failed": fail_count,
+                "total_urls": len(urls),
+                "log_saved": log_saved,
+                "queue_deleted": queue_deleted
+            })
+            
+            print(f"Completed: {success_count} submitted, {fail_count} failed for {language}")
+            
         else:
-            return jsonify({
-                "success": False,
-                "error": record_msg
-            }), 500
+            # REJECTION FLOW: Just update status
+            update_url_changes_status(language, "rejected", run_date)
+            
+            # Try to delete from queue
+            delete_from_queue(language, run_date)
+            
+            response_data["message"] = f"Rejected {language} - URLs will not be submitted"
+            print(f"Rejected {language}")
+        
+        return jsonify(response_data), 200
             
     except Exception as e:
+        print(f"Error in handle_approval: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e)
@@ -265,10 +513,11 @@ def home():
     """Home page with usage info"""
     return jsonify({
         "service": "IndexNow Approval Webhook",
-        "version": "2.0.0",
+        "version": "3.0.0",
+        "description": "Handles IndexNow approval workflow - submits URLs on approval",
         "endpoints": {
-            "POST /approval": "Record approval/rejection and update queue status",
-            "POST /process": "Check approved URLs ready for processing",
+            "POST /approval": "Process approval/rejection - submits to IndexNow on approval",
+            "POST /process": "Check URLs pending in queue",
             "GET /health": "Health check"
         },
         "example_approval_payload": {
@@ -279,13 +528,18 @@ def home():
             "notes": "Approved after review"
         },
         "workflow": [
-            "1. sitemap_compare.py queues URLs needing approval to indexnow_queue",
-            "2. Teams notification sent to approvers",
+            "1. sitemap_compare.py detects changes and queues URLs to indexnow_queue",
+            "2. If missing URLs > threshold, Teams approval card is sent",
             "3. Approver clicks Approve/Reject in Teams",
             "4. Power Automate calls POST /approval",
-            "5. Queue status updated, approval recorded",
-            "6. Run process_approved_indexnow.py to submit approved URLs"
-        ]
+            "5. On APPROVAL: URLs submitted to IndexNow API immediately, logged to IndexNow_log_report",
+            "6. On REJECTION: Status updated, URLs not submitted"
+        ],
+        "tables_updated": {
+            "indexnow_approvals": "Records approval/rejection with timestamp and approver",
+            "IndexNow_log_report": "Logs all IndexNow API submissions",
+            "url_changes": "Updates submission_status to 'submitted' or 'rejected'"
+        }
     }), 200
 
 
