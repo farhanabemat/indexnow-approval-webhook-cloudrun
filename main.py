@@ -10,7 +10,6 @@ Deploy to Cloud Run:
 """
 
 import os
-import json
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -33,6 +32,28 @@ app = Flask(__name__)
 def get_bq_client():
     """Get BigQuery client - uses default credentials in Cloud Run"""
     return bigquery.Client(project=BQ_PROJECT_ID)
+
+
+def normalize_run_date(value):
+    """Normalize any date string to YYYY-MM-DD for BigQuery DATE fields.
+    
+    Handles formats sent by Power Automate and sitemap_compare.py:
+      - YYYY-MM-DD           (already correct)
+      - DD-MM-YYYY
+      - DD-MM-YYYY_HH-MM-SS  (sitemap folder format)
+      - YYYY-MM-DDTHH:MM:SS  (ISO format)
+    Returns None if value is missing or unparseable.
+    """
+    if not value:
+        return None
+    value = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d-%m-%Y_%H-%M-%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value.split("T")[0] if "T" in value else value, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    print(f"WARNING: Could not normalize run_date '{value}' - will query without date filter")
+    return None
 
 
 def get_indexnow_credentials():
@@ -70,39 +91,51 @@ def extract_hostname(url):
 
 
 def get_queued_urls(language, run_date=None):
-    """Get URLs from indexnow_queue for a language"""
+    """Get URLs from indexnow_queue for a language.
+    
+    If run_date is provided and returns 0 rows, falls back to language-only query
+    so that cross-day approvals (queue inserted Mar 19, approved Mar 24) still work.
+    """
     try:
         client = get_bq_client()
-        
-        query = f"""
-        SELECT url, change_type, first_response, final_response, has_redirects
+        base_query = f"""
+        SELECT url, change_type, first_response, final_response, has_redirects, run_date
         FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_QUEUE_TABLE}`
         WHERE language = @language
         """
-        
-        params = [
-            bigquery.ScalarQueryParameter("language", "STRING", language),
-        ]
-        
+
+        def _run_query(extra_clause, extra_params):
+            params = [bigquery.ScalarQueryParameter("language", "STRING", language)] + extra_params
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            results = client.query(base_query + extra_clause, job_config=job_config).result()
+            urls = []
+            for row in results:
+                urls.append({
+                    'url': row.url,
+                    'change_type': row.change_type,
+                    'first_response': row.first_response,
+                    'final_response': row.final_response,
+                    'has_redirects': row.has_redirects,
+                    'run_date': str(row.run_date)
+                })
+            return urls
+
+        # Try with run_date filter first
         if run_date:
-            query += " AND run_date = @run_date"
-            params.append(bigquery.ScalarQueryParameter("run_date", "DATE", run_date))
-        
-        job_config = bigquery.QueryJobConfig(query_parameters=params)
-        results = client.query(query, job_config=job_config).result()
-        
-        urls = []
-        for row in results:
-            urls.append({
-                'url': row.url,
-                'change_type': row.change_type,
-                'first_response': row.first_response,
-                'final_response': row.final_response,
-                'has_redirects': row.has_redirects
-            })
-        
-        print(f"Found {len(urls)} URLs in queue for {language}")
+            urls = _run_query(
+                " AND run_date = @run_date",
+                [bigquery.ScalarQueryParameter("run_date", "DATE", run_date)]
+            )
+            if urls:
+                print(f"Found {len(urls)} URLs in queue for {language} (run_date={run_date})")
+                return urls
+            # Fallback: no date filter (handles cross-day approvals)
+            print(f"No URLs found for {language} with run_date={run_date}, falling back to language-only query")
+
+        urls = _run_query("", [])
+        print(f"Found {len(urls)} URLs in queue for {language} (no date filter)")
         return urls
+
     except Exception as e:
         print(f"Error getting queued URLs: {e}")
         return []
@@ -213,32 +246,44 @@ def save_indexnow_log(log_entries):
 
 
 def delete_from_queue(language, run_date=None):
-    """Delete processed URLs from indexnow_queue"""
+    """Delete processed URLs from indexnow_queue.
+    
+    If run_date is provided, deletes only that date's rows.
+    Falls back to language-only delete if streaming buffer prevents date-filtered delete.
+    """
     try:
         client = get_bq_client()
-        
-        query = f"""
-        DELETE FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_QUEUE_TABLE}`
-        WHERE language = @language
-        """
-        
-        params = [
-            bigquery.ScalarQueryParameter("language", "STRING", language),
-        ]
-        
+
+        def _delete(extra_clause, extra_params):
+            params = [bigquery.ScalarQueryParameter("language", "STRING", language)] + extra_params
+            query = f"""
+            DELETE FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{INDEXNOW_QUEUE_TABLE}`
+            WHERE language = @language{extra_clause}
+            """
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            client.query(query, job_config=job_config).result()
+
         if run_date:
-            query += " AND run_date = @run_date"
-            params.append(bigquery.ScalarQueryParameter("run_date", "DATE", run_date))
-        
-        job_config = bigquery.QueryJobConfig(query_parameters=params)
-        client.query(query, job_config=job_config).result()
-        
-        print(f"Deleted {language} URLs from queue")
+            try:
+                _delete(
+                    " AND run_date = @run_date",
+                    [bigquery.ScalarQueryParameter("run_date", "DATE", run_date)]
+                )
+                print(f"Deleted {language} (run_date={run_date}) from queue")
+                return True
+            except Exception as e:
+                if "streaming buffer" in str(e):
+                    print(f"Streaming buffer active for {language} - queue rows will remain until buffer flushes (~90 min)")
+                    return False
+                raise  # re-raise non-buffer errors
+
+        _delete("", [])
+        print(f"Deleted all {language} URLs from queue")
         return True
+
     except Exception as e:
-        # Streaming buffer error is expected for recent inserts
         if "streaming buffer" in str(e):
-            print(f"Cannot delete {language} from queue yet (streaming buffer)")
+            print(f"Cannot delete {language} from queue yet (streaming buffer - normal for recent inserts)")
         else:
             print(f"Error deleting from queue: {e}")
         return False
@@ -382,17 +427,21 @@ def handle_approval():
             return jsonify({"error": "No JSON data provided"}), 400
         
         # Extract fields
-        run_date = data.get('run_date')
+        run_date_raw = data.get('run_date')
+        run_date = normalize_run_date(run_date_raw)   # always YYYY-MM-DD or None
         language = data.get('language')
         action = data.get('action')
         responder = data.get('approved_by', data.get('responder', 'Unknown'))
         notes = data.get('notes', '')
         
+        print(f"Received: run_date_raw={run_date_raw!r} -> normalized={run_date!r}, language={language!r}, action={action!r}")
+        
         # Validate required fields
-        if not all([run_date, language, action]):
+        if not all([language, action]):
             return jsonify({
                 "error": "Missing required fields",
-                "required": ["run_date", "language", "action"]
+                "required": ["language", "action"],
+                "note": "run_date is optional - if missing, language-only queue lookup is used"
             }), 400
         
         status = "approved" if action.lower() in ["approve", "approved"] else "rejected"
